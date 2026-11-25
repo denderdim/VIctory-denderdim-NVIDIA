@@ -12789,34 +12789,44 @@ impl<'a> Lower<'a> {
         if let Some(f) = self.console_flat {
             return f;
         }
+        // Each host wave takes the next `wave` console threads from a group-
+        // shared counter: a bijection however the host packs its waves. A
+        // host wave need not hold consecutive flat ids (NVIDIA, 2D groups;
+        // found by ztrx), where the first lane's flat id rounded down gave
+        // two waves the same console threads. Branch-free in the entry
+        // block, which every thread runs.
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        let flat = self.s.op(
+        let void = self.s.t.void;
+        let wave = self.s.wave_size.expect("set with console lanes");
+        let lane = self.s.op(
             e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
+            "waveGetLaneIndex",
+            Attr::ReadOnly,
             i32t,
-            96,
+            111,
             &[],
         );
-        let first = self.s.op(
+        let arr = self.s.m.array(1, i32t);
+        let counter = self.s.m.global("wave_base", arr, 3);
+        let zero = self.s.m.i32(0);
+        let slot = self.s.m.element(e, counter, zero);
+        self.s.m.store(e, slot, zero);
+        let mode = self.s.m.i32(1 | 8);
+        self.s
+            .op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let first = self.s.m.cmp(e, pred::EQ, lane, zero);
+        let step = self.s.m.i32(wave);
+        let add = self.s.m.select(e, first, step, zero);
+        let slot = self.s.m.element(e, counter, zero);
+        let old = self.s.m.atomic(e, Rmw::Add, slot, add);
+        let base = self.s.op(
             e,
             "waveReadLaneFirst.i32",
             Attr::NoUnwind,
             i32t,
             118,
-            &[flat],
-        );
-        let wave = self.s.wave_size.expect("set with console lanes");
-        let mask = self.s.m.i32(!(wave - 1));
-        let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.s.op(
-            e,
-            "waveGetLaneIndex",
-            Attr::ReadOnly,
-            self.s.t.i32,
-            111,
-            &[],
+            &[old],
         );
         let f = self.s.m.bin(e, Bin::Add, base, lane);
         self.s.flags |= flags::WAVE_OPS;

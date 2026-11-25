@@ -211,6 +211,32 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
             return false;
         }
         let code = context.Rip as *const u8;
+        // A whole `clzero` loop in one exception, where its range is all
+        // writable: the title zeroes blocks this way all through a frame,
+        // and an Intel CPU took an exception per 64 bytes (ztrx, XCL).
+        let room = 0x1000 - (context.Rip as usize & 0xfff);
+        if room >= 12 {
+            let bytes = code.cast::<[u8; 12]>().read_unaligned();
+            if let Some(end_reg) = clzero_loop(&bytes) {
+                let end = *gpr(context, end_reg);
+                let rax = context.Rax;
+                // Iterations: the first always, then while rax < end.
+                let n = if end > rax { (end - rax).div_ceil(64) } else { 1 };
+                let from = (rax & !63) as usize;
+                let to = from.wrapping_add((n as usize).wrapping_mul(64));
+                // Unchecked, like a single clzero below: the console faults
+                // where this does. (Asking Windows first took 2-9 ms per
+                // query in the title's large heaps, per ztrx.)
+                if n < (1 << 25) && to > from {
+                    (from as *mut u8).write_bytes(0, to - from);
+                    context.Rax = rax.wrapping_add(n * 64);
+                    let flags = cmp_flags(context.Rax, end);
+                    context.EFlags = context.EFlags & !CMP_FLAGS | flags;
+                    context.Rip += 12;
+                    return true;
+                }
+            }
+        }
         match code.cast::<[u8; 3]>().read_unaligned() {
             [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
             [0x0f, 0x01, 0xfa] => {}
@@ -253,6 +279,22 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         context.Rip += 3;
     }
     true
+}
+
+/// `clzero; add rax, 0x40; cmp rax, <reg>; jb -12` (`0f 01 fc`,
+/// `48 83 c0 40`, `48|4c 39 /r` with rax as r/m, `72 f4`): the register
+/// holding the end, in CONTEXT order (rax, rcx, rdx, rbx, rsp, rbp, rsi,
+/// rdi, r8..r15). The pattern is the one ztrx (from XCL) matches.
+fn clzero_loop(code: &[u8; 12]) -> Option<u8> {
+    let (rex, modrm) = (code[7], code[9]);
+    let ok = code[..3] == [0x0f, 0x01, 0xfc]
+        && code[3..7] == [0x48, 0x83, 0xc0, 0x40]
+        && (rex == 0x48 || rex == 0x4c)
+        && code[8] == 0x39
+        && modrm >> 6 == 3
+        && modrm & 7 == 0
+        && code[10..12] == [0x72, 0xf4];
+    ok.then(|| ((modrm >> 3) & 7) | if rex == 0x4c { 8 } else { 0 })
 }
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
@@ -942,6 +984,58 @@ mod tests {
         assert_eq!(emulate(&[0x0f, 0x01, 0xfc], at, &mut xmm), Some(3));
         assert!(line.0[..64].iter().all(|&b| b == 0));
         assert!(line.0[64..].iter().all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn clzero_loops_are_recognised() {
+        // cmp rax, r10 (4c 39 d0); cmp rax, rdx (48 39 d0)
+        let loop_with = |rex, modrm| {
+            [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, rex, 0x39, modrm, 0x72, 0xf4]
+        };
+        assert_eq!(super::clzero_loop(&loop_with(0x4c, 0xd0)), Some(10));
+        assert_eq!(super::clzero_loop(&loop_with(0x48, 0xd0)), Some(2));
+        // cmp rdx, rax is another instruction.
+        assert_eq!(super::clzero_loop(&loop_with(0x48, 0xc2)), None);
+        let mut other = loop_with(0x48, 0xd0);
+        other[11] = 0xf0;
+        assert_eq!(super::clzero_loop(&other), None);
+    }
+
+    #[test]
+    fn emulated_clzero_loop_zeroes_its_whole_range_at_once() {
+        #[repr(align(64))]
+        struct Lines([u8; 256]);
+        let mut lines = Lines([0xff; 256]);
+        let base = lines.0.as_mut_ptr() as u64;
+        // clzero; add rax, 0x40; cmp rax, rdx; jb -12
+        let mut bytes = [0xcc_u8; 16];
+        bytes[..12].copy_from_slice(&[
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xd0, 0x72, 0xf4,
+        ]);
+        // SAFETY: as in `emulate_as`; the loop writes only `lines`.
+        unsafe {
+            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+            record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = bytes.as_ptr() as u64;
+            context.Rax = base + 5;
+            context.Rdx = base + 192;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut context,
+            };
+            // The page may end within the 12 bytes; then it is one line.
+            if 0x1000 - (bytes.as_ptr() as usize & 0xfff) < 12 {
+                return;
+            }
+            assert!(emulate_amd_only(&mut pointers));
+            assert_eq!(context.Rip, bytes.as_ptr() as u64 + 12);
+            assert_eq!(context.Rax, base + 5 + 192);
+            // Carry clear: the loop's jb falls through.
+            assert_eq!(context.EFlags & 1, 0);
+        }
+        assert!(lines.0[..192].iter().all(|&b| b == 0));
+        assert!(lines.0[192..].iter().all(|&b| b == 0xff));
     }
 
     #[test]

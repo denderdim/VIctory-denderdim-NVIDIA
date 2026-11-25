@@ -540,6 +540,36 @@ const PAGE: u32 = victory_shader::emit::PAGE;
 /// A page map entry of a virtual page with no heap page yet.
 const UNMAPPED: u32 = u32::MAX;
 
+/// Dynamic view slots held now and at most, and title view pages wanted
+/// after the pool ran out (each counted once): how a paged heap should be
+/// split, for the memory log ([`usage`]).
+static DYN_HELD: AtomicU64 = AtomicU64::new(0);
+static DYN_PEAK: AtomicU64 = AtomicU64::new(0);
+static MISSED_PAGES: AtomicU64 = AtomicU64::new(0);
+static MISSED: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+/// One line for the memory log: the paged view heap's dynamic slots held
+/// (now, peak) and title pages it could not map.
+pub(crate) fn usage() -> String {
+    format!(
+        "dynamic views {} (peak {}), title view pages missed {}",
+        DYN_HELD.load(Ordering::Relaxed),
+        DYN_PEAK.load(Ordering::Relaxed),
+        MISSED_PAGES.load(Ordering::Relaxed)
+    )
+}
+
+/// Counts virtual view page `page` as wanted but not mapped, once.
+fn note_missed(page: u32) {
+    let (word, bit) = ((page / 64) as usize, 1u64 << (page % 64));
+    let Some(w) = MISSED.get(word) else {
+        return;
+    };
+    if w.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        MISSED_PAGES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Where a view heap's slots are: virtual slots (as shaders index them,
 /// below `victory_shader::emit::OWN_SLOTS`) and the heap's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -928,6 +958,7 @@ impl HostHeap {
         let (next, end) = *pool;
         if next + PAGE > end {
             drop(pool);
+            note_missed(page);
             if !p.spent.swap(true, Ordering::AcqRel) {
                 tracing::warn!(
                     index,
@@ -1106,6 +1137,10 @@ impl HostHeap {
             return None;
         };
         taken[first..first + n].fill(true);
+        if !self.sampler {
+            let held = DYN_HELD.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+            DYN_PEAK.fetch_max(held, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         if !self.sampler {
             static MADE: AtomicU64 = AtomicU64::new(0);
@@ -1140,6 +1175,12 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = at.saturating_add(n).min(self.spare) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            if !self.sampler {
+                let freed = slots.iter().filter(|t| **t).count() as u64;
+                let _ = DYN_HELD.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(freed))
+                });
+            }
             slots.fill(false);
         }
     }

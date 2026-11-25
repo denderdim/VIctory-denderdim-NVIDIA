@@ -252,9 +252,18 @@ pub(crate) fn resolve(list: &HostList) -> bool {
 }
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL)"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants=1, b0, visibility=SHADER_VISIBILITY_PIXEL)"
 Texture2D<float> depth_ : register(t0);
 Texture2D<uint> stencil_ : register(t1);
+cbuffer Bit : register(b0) { uint bit_; };
+// Hosts without SV_StencilRef (NVIDIA): one stencil bit per draw, kept
+// where it is set (stencil reference all ones, write mask that bit).
+[RootSignature(RS)]
+void stencil_bit(float4 at : SV_Position) {
+    if (((stencil_.Load(int3(at.xy, 0)) >> bit_) & 1) == 0) {
+        discard;
+    }
+}
 [RootSignature(RS)]
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
@@ -282,8 +291,9 @@ uint stencil_only(float4 at : SV_Position) : SV_StencilRef {
 /// flight.
 const SLOTS: u32 = 4096;
 
-/// Depth format, depth written, stencil written.
-type PipelineKey = (i32, bool, bool);
+/// Depth format, depth written, stencil written, and for a stencil bit
+/// draw its write mask (else 0).
+type PipelineKey = (i32, bool, bool, u8);
 
 struct Copier {
     root: ID3D12RootSignature,
@@ -291,6 +301,7 @@ struct Copier {
     both: ID3DBlob,
     depth_only: ID3DBlob,
     stencil_only: ID3DBlob,
+    stencil_bit: ID3DBlob,
     /// Whether the host takes stencil values from pixel shaders.
     stencil_ref: bool,
     /// By depth format, depth written, stencil written.
@@ -348,6 +359,7 @@ fn make_copier(host: &Host) -> windows::core::Result<Copier> {
     let both = compile(s!("both"), s!("ps_5_1"))?;
     let depth_only = compile(s!("depth_only"), s!("ps_5_1"))?;
     let stencil_only = compile(s!("stencil_only"), s!("ps_5_1"))?;
+    let stencil_bit = compile(s!("stencil_bit"), s!("ps_5_1"))?;
     let device = &host.device;
     let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
     // SAFETY: the structure the feature names, ours.
@@ -361,7 +373,7 @@ fn make_copier(host: &Host) -> windows::core::Result<Copier> {
     .is_ok()
         && options.PSSpecifiedStencilRefSupported.as_bool();
     if !stencil_ref {
-        tracing::warn!("the host takes no stencil from pixel shaders: depth twins copy depth only");
+        tracing::warn!("the host takes no stencil from pixel shaders: depth twins copy stencil a bit per draw");
     }
     // SAFETY: a root signature the compiler embedded.
     let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, bytes(&vs))? };
@@ -380,6 +392,7 @@ fn make_copier(host: &Host) -> windows::core::Result<Copier> {
         both,
         depth_only,
         stencil_only,
+        stencil_bit,
         stencil_ref,
         pipelines: std::sync::Mutex::new(Vec::new()),
         views,
@@ -390,17 +403,29 @@ fn make_copier(host: &Host) -> windows::core::Result<Copier> {
 }
 
 impl Copier {
-    fn pipeline(&self, host: &Host, format: DXGI_FORMAT, depth: bool, stencil: bool) -> Option<ID3D12PipelineState> {
-        let key = (format.0, depth, stencil);
+    /// The copy pipeline of the planes asked; with `bit` (and stencil
+    /// only), the draw that sets stencil bit `bit` where the twin has it.
+    fn pipeline(
+        &self,
+        host: &Host,
+        format: DXGI_FORMAT,
+        depth: bool,
+        stencil: bool,
+        bit: Option<u32>,
+    ) -> Option<ID3D12PipelineState> {
+        let mask = bit.map_or(0, |b| 1u8 << b);
+        let key = (format.0, depth, stencil, mask);
         let mut made = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, p)) = made.iter().find(|(k, _)| *k == key) {
             return Some(p.clone());
         }
-        let ps = match (depth, stencil) {
-            (true, true) => &self.both,
-            (true, false) => &self.depth_only,
-            (false, true) => &self.stencil_only,
-            (false, false) => return None,
+        let ps = match (depth, stencil, bit) {
+            (false, true, Some(_)) => &self.stencil_bit,
+            (_, _, Some(_)) => return None,
+            (true, true, None) => &self.both,
+            (true, false, None) => &self.depth_only,
+            (false, true, None) => &self.stencil_only,
+            (false, false, None) => return None,
         };
         let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
             // SAFETY: the blob lives as long as the copier.
@@ -437,7 +462,7 @@ impl Copier {
                 DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
                 StencilEnable: stencil.into(),
                 StencilReadMask: 0xff,
-                StencilWriteMask: 0xff,
+                StencilWriteMask: if bit.is_some() { mask } else { 0xff },
                 FrontFace: face,
                 BackFace: face,
             },
@@ -457,7 +482,7 @@ impl Copier {
                 Some(p)
             }
             Err(e) => {
-                once!(error = %e, ?format, depth, stencil, "depth twin copy pipeline refused");
+                once!(error = %e, ?format, depth, stencil, ?bit, "depth twin copy pipeline refused");
                 None
             }
         }
@@ -486,10 +511,29 @@ fn copy(list: &HostList, resource: This, depth: bool, stencil: bool) -> bool {
     let Some(c) = copier(host) else {
         return false;
     };
-    let stencil = stencil && c.stencil_ref && twin.stencil.is_some();
-    let Some(pso) = c.pipeline(host, twin.dsv_format, depth, stencil) else {
-        return false;
+    let stencil = stencil && twin.stencil.is_some();
+    // Stencil through SV_StencilRef where the host takes it; else cleared
+    // and set a bit per draw.
+    let direct = stencil && c.stencil_ref;
+    let main = if depth || direct {
+        match c.pipeline(host, twin.dsv_format, depth, direct, None) {
+            Some(p) => Some(p),
+            None => return false,
+        }
+    } else {
+        None
     };
+    let bits: Vec<ID3D12PipelineState> = if stencil && !direct {
+        (0..8)
+            .map_while(|b| c.pipeline(host, twin.dsv_format, false, true, Some(b)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let bits = if bits.len() == 8 { bits } else { Vec::new() };
+    if main.is_none() && bits.is_empty() {
+        return false;
+    }
     let l = &list.list;
     const DEPTH_WRITE: u32 = 0x10;
     crate::list::ensure_state(list, resource, DEPTH_WRITE);
@@ -545,7 +589,6 @@ fn copy(list: &HostList, resource: This, depth: bool, stencil: bool) -> bool {
         l.OMSetRenderTargets(0, None, false, Some(&dsv));
         l.SetDescriptorHeaps(&[Some(c.views.clone())]);
         l.SetGraphicsRootSignature(&c.root);
-        l.SetPipelineState(&pso);
         l.SetGraphicsRootDescriptorTable(
             0,
             D3D12_GPU_DESCRIPTOR_HANDLE {
@@ -565,17 +608,48 @@ fn copy(list: &HostList, resource: This, depth: bool, stencil: bool) -> bool {
             right: twin.width as i32,
             bottom: twin.height as i32,
         }]);
-        l.DrawInstanced(3, 1, 0, 0);
+        if let Some(pso) = &main {
+            l.SetPipelineState(pso);
+            l.DrawInstanced(3, 1, 0, 0);
+        }
+        if !bits.is_empty() {
+            l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_STENCIL, 0.0, 0, None);
+            l.OMSetStencilRef(0xff);
+            for (b, pso) in bits.iter().enumerate() {
+                l.SetPipelineState(pso);
+                l.SetGraphicsRoot32BitConstant(1, b as u32, 0);
+                l.DrawInstanced(3, 1, 0, 0);
+            }
+            // The title's reference, if it set one, goes back with its
+            // state (`continue_in`); else the default.
+            l.OMSetStencilRef(0);
+        }
         l.ResourceBarrier(&barriers(
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         ));
     }
     list.keep(&c.views);
-    list.keep(&pso);
+    for pso in main.iter().chain(&bits) {
+        list.keep(pso);
+    }
     list.keep(&twin.depth);
     if let Some(s) = &twin.stencil {
         list.keep(s);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::core::s;
+
+    /// Every copy shader compiles, with the root signature they share.
+    #[test]
+    fn copy_shaders_compile() {
+        for entry in [s!("both"), s!("depth_only"), s!("stencil_only"), s!("stencil_bit")] {
+            super::compile(entry, s!("ps_5_1")).unwrap();
+        }
+        super::compile(s!("vs"), s!("vs_5_1")).unwrap();
+    }
 }
