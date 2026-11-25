@@ -521,6 +521,13 @@ struct Lower<'a> {
     console_cf: bool,
     /// Split without [`Self::console_cf`] cannot run it, the console flow can.
     wants_console_flow: bool,
+    /// Why a wave64 program with console lanes can neither be split in
+    /// halves nor run in the console flow on a 32-lane host.
+    halves_blocked: Why,
+    /// Scalars joined or left from loops by a host wave operation in a
+    /// console wave64 split over 32-lane host waves (see
+    /// [`Self::note_wave_finals`]).
+    wave_finals: bool,
     /// The console thread's flat id in the group (relabelled; see
     /// [`Self::thread_id`]).
     console_flat: Option<V>,
@@ -1111,6 +1118,7 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let mut split = false;
         let mut wants_console_flow = false;
+        let mut halves_blocked: Why = "console wave64 lanes on a host without 64-lane waves";
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1129,18 +1137,19 @@ impl<'a> Lower<'a> {
                         .map(|(_, inst)| inst)
                 })
             };
-            // Swizzles, DPP and quad derivatives read lanes of the same 32
-            // (rows of 16, groups of 8, 32 or 4): the rest may read the
-            // other half of a wave64.
+            // Swizzles, DPP, quad derivatives and `v_permlane16`/`x16` read
+            // lanes of the same 32 (rows of 16, groups of 8, 32 or 4; on
+            // gfx10 permlanex16 swaps the two rows of a half, never the
+            // halves): the rest may read the other half of a wave64.
             let in_half = |i: &Inst| {
                 i.name().starts_with("ds_swizzle")
+                    || i.name().starts_with("v_permlane")
                     || implicit_derivatives(i.name())
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
             let whole = |i: &Inst| {
                 let n = i.name();
                 n.contains("permute")
-                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     // Its derivatives are the quad's.
                     || n == "image_sample"
@@ -1191,17 +1200,32 @@ impl<'a> Lower<'a> {
                 && x.target.runs(32)
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             // The rest of such programs need the halves to exchange values
-            // (masks read whole, lanes of the other half): the console flow,
-            // for a group of one console wave without LDS.
-            wants_console_flow = console_lanes
+            // (masks read whole, lanes of the other half), and a group of
+            // one console wave that shares LDS needs them to meet before
+            // each LDS access (its compiler counts on the lockstep): the
+            // console flow, for a group of one console wave.
+            wants_console_flow = (console_lanes || one_wave && s.lds_dwords > 0)
                 && !split
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && s.lds_dwords == 0
                 && cs.threads.iter().product::<u32>() <= 64
-                && !insts().any(|i| i.name().contains("permute"))
-                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+                && !insts().any(|i| i.name().contains("permute"));
+            // (Whole-wave sections run there as each half's reduction
+            // combined with the other's: see `shape`.)
+            // The first thing that keeps such a program off both forms, so
+            // the refusal says what the 32-lane forms still lack.
+            halves_blocked = if cs.threads.iter().product::<u32>() > 64 {
+                if s.lds_dwords > 0 {
+                    "console wave64 lanes with LDS in a group of more than 64 threads on a host without 64-lane waves"
+                } else {
+                    "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves"
+                }
+            } else if insts().any(|i| i.name().contains("permute")) {
+                "console wave64 lanes with ds_permute on a host without 64-lane waves"
+            } else {
+                "console wave64 lanes on a host without 64-lane waves"
+            };
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
             // [`CONSOLE_FLOW`]).
@@ -1317,6 +1341,8 @@ impl<'a> Lower<'a> {
             split,
             console_cf: x.console_cf,
             wants_console_flow,
+            halves_blocked,
+            wave_finals: false,
             console_flat: None,
             xchg: None,
             flat: None,
@@ -1792,7 +1818,7 @@ impl<'a> Lower<'a> {
     /// another wave size, what the HLSL wave operation the console compiler
     /// expanded gives on that wave.
     fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
-        use super::wave::{Op, Shape};
+        use super::wave::Shape;
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
@@ -1817,15 +1843,32 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo_v, hi_v]);
                 let (k0, u0) = (self.s.m.i8(0), self.s.m.i8(0));
-                let sum = self
+                let mut sum = self
                     .s
                     .op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[d, k0, u0]);
                 let i32t = self.s.t.i32;
                 let pair = self.s.m.named_struct("dx.types.splitdouble", vec![i32t, i32t]);
-                let split = self
+                if self.split && self.console_cf && self.two_halves() {
+                    // Each half's sum, then both halves': see `two_halves`.
+                    let words = self
+                        .s
+                        .op(c, "splitDouble.f64", Attr::ReadNone, pair, 102, &[sum]);
+                    let lo_w = self.s.m.extract(c, words, 0);
+                    let hi_w = self.s.m.extract(c, words, 1);
+                    let (l0, h0) = self.exchange(c, lo_w);
+                    let (l1, h1) = self.exchange(c, hi_w);
+                    let a = self
+                        .s
+                        .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[l0, l1]);
+                    let b = self
+                        .s
+                        .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[h0, h1]);
+                    sum = self.s.m.bin(c, Bin::Add, a, b);
+                }
+                let words = self
                     .s
                     .op(c, "splitDouble.f64", Attr::ReadNone, pair, 102, &[sum]);
-                return Ok(self.s.m.extract(c, split, u32::from(is_hi)));
+                return Ok(self.s.m.extract(c, words, u32::from(is_hi)));
             }
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
@@ -1847,7 +1890,7 @@ impl<'a> Lower<'a> {
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
         }
-        if self.split {
+        if self.split && !self.console_cf {
             return Err("a wave reduction in a wave64 program split in halves");
         }
         let c = self.cur;
@@ -1861,6 +1904,92 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
+        let r = self.half_shape(op, x, prefix)?;
+        if !(self.split && self.console_cf && self.two_halves()) {
+            return Ok(r);
+        }
+        // Console flow, one console wave64 as two host waves of 32 (every
+        // host lane runs; the console's inactive lanes hold the identity):
+        // each half's result above, combined with the other half's.
+        let (_, half) = self.console_lane();
+        Ok(match prefix {
+            None => {
+                let (lo, hi) = self.exchange(c, r);
+                self.combine_halves(op, lo, hi)
+            }
+            Some(_) => {
+                // The upper half's prefixes start from the lower half's total.
+                let total = self.half_shape(op, x, None)?;
+                let (lo_total, _) = self.exchange(c, total);
+                let upper = self.combine_halves(op, lo_total, r);
+                let z = self.s.m.i32(0);
+                let is_upper = self.s.m.cmp(c, pred::NE, half, z);
+                self.s.m.select(c, is_upper, upper, r)
+            }
+        })
+    }
+
+    /// Console flow: whether the group has an upper half of 32 lanes (a
+    /// group of 32 threads or fewer is one host wave; see `exchange`).
+    fn two_halves(&self) -> bool {
+        self.s
+            .threads
+            .is_some_and(|t| t.iter().product::<u32>() > 32)
+    }
+
+    /// `op` of two halves' results (as i32 words of the reduction's type).
+    fn combine_halves(&mut self, op: super::wave::Op, a: V, b: V) -> V {
+        use super::wave::Op;
+        let c = self.cur;
+        match op {
+            Op::AddU => self.s.m.bin(c, Bin::Add, a, b),
+            Op::Or => self.s.m.bin(c, Bin::Or, a, b),
+            Op::And => self.s.m.bin(c, Bin::And, a, b),
+            Op::Xor => self.s.m.bin(c, Bin::Xor, a, b),
+            Op::MinU | Op::MaxU | Op::MinI | Op::MaxI => {
+                let p = match op {
+                    Op::MinU => pred::IULT,
+                    Op::MaxU => pred::IUGT,
+                    Op::MinI => pred::SLT,
+                    _ => pred::SGT,
+                };
+                let t = self.s.m.cmp(c, p, a, b);
+                self.s.m.select(c, t, a, b)
+            }
+            Op::AddF | Op::MinF | Op::MaxF => {
+                let (fa, fb) = (self.as_float(a), self.as_float(b));
+                let r = match op {
+                    Op::AddF => self.s.m.bin(c, Bin::Add, fa, fb),
+                    _ => self.max_min(op == Op::MaxF, fa, fb),
+                };
+                self.as_int(r)
+            }
+            Op::AddF16 => {
+                let f32t = self.s.t.f32;
+                let i32t = self.s.t.i32;
+                let fa = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[a]);
+                let fb = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[b]);
+                let r = self.s.m.bin(c, Bin::Add, fa, fb);
+                self.s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r])
+            }
+        }
+    }
+
+    /// The host wave's reduction or prefix (`prefix`: inclusive or not) by
+    /// `op` of `x` (an i32 word; inactive lanes already hold the identity).
+    fn half_shape(
+        &mut self,
+        op: super::wave::Op,
+        x: V,
+        prefix: Option<bool>,
+    ) -> Result<V, Why> {
+        use super::wave::Op;
+        let c = self.cur;
         self.s.flags |= flags::WAVE_OPS;
         let f16 = op == Op::AddF16;
         let float = matches!(op, Op::AddF | Op::AddF16 | Op::MinF | Op::MaxF);
@@ -1934,6 +2063,11 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let user_data = self.lower_ir()?;
+        if self.wave_finals && !self.x.per_lane_only {
+            // See `note_wave_finals`; what the console flow cannot lower
+            // keeps this form (`per_lane_only`).
+            return Err(unsupported(0, CONSOLE_FLOW));
+        }
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
@@ -1970,7 +2104,7 @@ impl<'a> Lower<'a> {
             return Err(unsupported(
                 0,
                 match (n, self.console_lanes) {
-                    (64, true) => "console wave64 lanes on a host without 64-lane waves",
+                    (64, true) => self.halves_blocked,
                     (64, false) => {
                         "a wave64 group sharing LDS without barriers on a host without 64-lane waves"
                     }
@@ -4616,6 +4750,22 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let guard = self.guard(b, i)?;
+        if self.console_cf
+            && self.split
+            && self.s.lds_dwords > 0
+            && !(name == "ds_swizzle_b32" || name.contains("permute"))
+        {
+            // One console wave64 runs as two host waves of 32. On the
+            // console its LDS instructions run in lockstep for all 64 lanes,
+            // so its compiler leaves out barriers between them; here a
+            // group barrier before each one gives the same order: every
+            // earlier LDS access of both halves is done first. In the
+            // console flow both halves reach every block, so it is uniform.
+            let mode = self.s.m.i32(1 | 8);
+            let void = self.s.t.void;
+            self.s
+                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        }
         let c = self.cur;
         let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
         let dst_reg = match dst {
@@ -8181,9 +8331,11 @@ impl<'a> Lower<'a> {
             "v_permlane16_b32" | "v_permlanex16_b32" => {
                 let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 self.cross_lane(false)?;
-                if self.split || self.console_cf {
-                    return Err("a lane permutation in a program split in halves");
-                }
+                // The lanes read are in this lane's half of 32, so in a
+                // program split in halves (or in console flow, whose host
+                // waves are those halves) they are in its host wave, at the
+                // host lane computed from its own: `lane_index` is the host
+                // lane, which is the console lane within the half.
                 let l = self.lane_index();
                 let k = |l: &mut Self, x: u32| l.s.m.i32(x);
                 let (k7, k8, k2, k15, top, zero) =
@@ -12266,6 +12418,30 @@ impl<'a> Lower<'a> {
     /// order, and the lanes of the highest rank hold the wave's values.
     // shortcut: a scalar both paths change is the later path's own result,
     // not that path run on the earlier one's.
+    /// The scalar finals of [`Self::join_scalars`] and [`Self::leave_loops`]
+    /// take the wave's last path from a host wave operation. A console
+    /// wave64 on a host without 64-lane waves runs as two host waves, each
+    /// of which would take its own half's (seen on an RTX 5070: a loop's
+    /// iteration count read after it was 32 in the lower half, 64 in the
+    /// upper): such a program asks for the console flow, where both halves
+    /// run every path together.
+    fn note_wave_finals(&mut self) {
+        // The console flow holds compute groups of one console wave.
+        let one_wave = self.s.mesh.is_none()
+            && self
+                .s
+                .threads
+                .is_some_and(|t| t.iter().product::<u32>() <= 64);
+        if self.x.native.wave64
+            && !self.x.target.runs(64)
+            && self.x.target.runs(32)
+            && !self.console_cf
+            && one_wave
+        {
+            self.wave_finals = true;
+        }
+    }
+
     fn join_scalars(&mut self, b: usize) {
         let p = self.x.p;
         if self.counters.contains_key(&b) {
@@ -12296,6 +12472,7 @@ impl<'a> Lower<'a> {
         if preds.len() < 2 {
             return;
         }
+        self.note_wave_finals();
         let mut order: Vec<usize> = preds.iter().map(|&(q, _)| q).collect();
         order.sort_by_key(|&q| (p.blocks[q].offset, self.rpo[q]));
         order.dedup();
@@ -12358,6 +12535,9 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let i32t = self.s.t.i32;
+        if !loops.is_empty() {
+            self.note_wave_finals();
+        }
         for (h, values) in loops {
             let (count, _) = self.counters[&h];
             let (max, unsigned) = (self.s.m.i8(3), self.s.m.i8(1));

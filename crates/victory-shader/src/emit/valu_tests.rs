@@ -1338,6 +1338,11 @@ fn tbuffer_d16_loads_pack_two_channels_per_dword() {
 /// A wave64 compute program of 64 lanes (thread id in v0) with `body` between
 /// the descriptor load and the store of v0 at byte 4 * lane.
 fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
+    build_lanes_cs_lds(body, 0)
+}
+
+/// [`build_lanes_cs`] with `lds_granules` of 512 bytes of LDS.
+fn build_lanes_cs_lds(body: &[u32], lds_granules: u32) -> Result<HostShader, String> {
     let mut words = Vec::new();
     words.push(s_mov_b32(5, 0x80));
     words.extend_from_slice(&s_load_dwordx4(8, 4));
@@ -1384,7 +1389,7 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1,
+            rsrc2: 5 << 1 | lds_granules << 15,
             threads: [64, 1, 1],
         }),
         code,
@@ -1393,7 +1398,11 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
     let res = resource::track(&p, &native.layout, native.stage).map_err(|e| format!("{e:?}"))?;
     let io = io::raise(&p, &native).map_err(|e| format!("{e:?}"))?;
     let st = structure::structure(&p).map_err(|e| format!("{e:?}"))?;
-    let lowered = lower::lower(&lower::Parts {
+    // For the device the test runs on: on a host without 64-lane waves
+    // (NVIDIA) these wave64 programs run as two halves in the console flow,
+    // as the game's do (the retry of `emit`).
+    let target = Host::new(false).map_or(crate::emit::Target::ANY, |h| h.target());
+    let mut parts = lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -1403,11 +1412,21 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        target: crate::emit::Target::ANY,
+        target,
         psv: None,
         console_cf: false,
         per_lane_only: false,
-    })
+    };
+    let console;
+    let lowered = match lower::lower(&parts) {
+        Err(crate::ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
+            console = structure::structure_console(&p).map_err(|e| format!("{e:?}"))?;
+            parts.st = &console;
+            parts.console_cf = true;
+            lower::lower(&parts)
+        }
+        l => l,
+    }
     .map_err(|e| format!("{e:?}"))?;
     Ok(HostShader {
         stage: HwStage::Cs,
@@ -1463,6 +1482,44 @@ fn loop_exit_mask_counted_after_the_loop() {
         got.iter().all(|&x| x == 64),
         "lanes counted as exited: {got:?}"
     );
+}
+
+/// One wave64 group sharing LDS with no barrier: each lane writes its id,
+/// then reads the lane 32 away, in the other half. The console runs the 64
+/// lanes in lockstep, so every write is done before any read; on a host
+/// without 64-lane waves the two host waves must meet in between.
+#[test]
+fn lds_read_across_halves_without_barriers() {
+    let body = [
+        0x7E14_0300, // v_mov_b32 v10, v0 (thread id kept)
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0   (byte address)
+        0xD834_0000, 0x0000_0002, // ds_write_b32 v2, v0
+        0x3A06_04FF, 0x0000_0080, // v_xor_b32 v3, 0x80, v2  (lane ^ 32)
+        0xD8D8_0000, 0x0000_0003, // ds_read_b32 v0, v3
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    let shader = build_lanes_cs_lds(&body, 1).unwrap_or_else(|e| panic!("translation: {e}"));
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    let got: Vec<u32> = out[0][..64].to_vec();
+    let want: Vec<u32> = (0..64).map(|l| l ^ 32).collect();
+    assert_eq!(got, want, "lanes read across the halves");
 }
 
 /// A scalar counter a divergent loop adds to in every iteration, read after

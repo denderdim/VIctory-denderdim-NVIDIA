@@ -33,6 +33,15 @@ const EXCEPTIONS: &[(&str, &str)] = &[(
     "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
 )];
 
+/// Source files we wrote that are allowed past [`MAX_FILE_SIZE`], with their
+/// own limit and a reason. Every other check still applies to them (text,
+/// no long encoded runs, no forbidden signatures).
+const SIZE_EXCEPTIONS: &[(&str, usize, &str)] = &[(
+    "crates/victory-shader/src/emit/lower.rs",
+    768 * 1024,
+    "the shader translator's lowering, hand-written Rust that grew past the limit upstream; to be split into modules",
+)];
+
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
     (b"MZ", "PE executable"),
@@ -154,9 +163,13 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
-    if content.len() > MAX_FILE_SIZE {
+    let limit = SIZE_EXCEPTIONS
+        .iter()
+        .find(|(p, _, _)| *p == path)
+        .map_or(MAX_FILE_SIZE, |&(_, bytes, _)| bytes);
+    if content.len() > limit {
         problems.push(format!(
-            "{} bytes exceeds the {MAX_FILE_SIZE}-byte limit",
+            "{} bytes exceeds the {limit}-byte limit",
             content.len()
         ));
     }
