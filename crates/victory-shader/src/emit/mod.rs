@@ -114,8 +114,8 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -668,17 +668,28 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs,
-        outputs,
-        prims,
-        mesh_stride,
-    })?;
+    // XboxBvhBuilder's Box32/16 rehydration programs write one header per
+    // thread a `DispatchX` of individual threads asked for; their last
+    // group can be short, and its other threads must store nothing (found
+    // by DexNom, whose digests these are).
+    let box_rehydration = matches!(
+        u128::from_be_bytes(c.digest),
+        0xba30_5538_e28d_414c_af39_a51a_4bc2_f308 | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
+    ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
+    let l = lower::lower_with_thread_limit(
+        &lower::Parts {
+            native,
+            p,
+            st,
+            io,
+            res,
+            inputs,
+            outputs,
+            prims,
+            mesh_stride,
+        },
+        box_rehydration,
+    )?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

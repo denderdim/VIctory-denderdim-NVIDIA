@@ -67,6 +67,10 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// A compute program's thread-group size, once looked at
+    /// ([`compute_group`]).
+    #[cfg(windows)]
+    group: OnceLock<Option<[u32; 3]>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +123,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(windows)]
+                group: OnceLock::new(),
             })
         })
         .clone()
@@ -348,6 +354,26 @@ pub(crate) fn walk_held(this: This) -> bool {
         });
     }
     true
+}
+
+/// The thread-group size of the compute program of the title's pipeline
+/// `this`, from its console container (looked at once per program).
+#[cfg(windows)]
+pub(crate) fn compute_group(this: This) -> Option<[u32; 3]> {
+    use victory_shader::{Container, FourCC, native::StageIo};
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let shader = p.shaders.iter().find(|s| s.stage == "compute")?;
+    *shader.group.get_or_init(|| {
+        let c = Container::parse(&shader.container).ok()?;
+        let programs = victory_shader::native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+        programs.iter().find_map(|p| match p.io {
+            StageIo::Cs(cs) => Some(cs.threads),
+            _ => None,
+        })
+    })
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.

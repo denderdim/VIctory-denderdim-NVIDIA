@@ -87,9 +87,15 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_thread_limit(parts, false)
+}
+
+/// [`lower`]; with `partial`, threads in x past the host's
+/// [`super::USER_DISPATCH_THREADS_X`] (when it is not 0) end at once.
+pub(crate) fn lower_with_thread_limit(parts: &Parts, partial: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad).run(partial) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -2190,7 +2196,34 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, first, sum)
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn run(mut self, partial: bool) -> Result<Lowered, Stop> {
+        if partial {
+            // A dispatch of individual threads (after DexNom): the threads of
+            // the last group past the count end before anything else, so they
+            // count in no wave operation and store nothing.
+            // shortcut: a program that meets its other half at group barriers
+            // (64-lane waves on 32-lane hosts) relies on the host leaving
+            // ended threads out of the barrier, as NVIDIA's does.
+            let original = self.s.entry;
+            let width = self.s.threads.expect("compute thread count")[0];
+            let limit = self.host_word(RootType::Other(super::USER_DISPATCH_THREADS_X), 0, width);
+            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else { unreachable!() };
+            // The console's thread (relabelled where host waves are not the
+            // console's), made in the entry block every thread runs.
+            let Val::I32(thread) = self.thread_id(0) else { unreachable!() };
+            let width = self.s.m.i32(width);
+            let first = self.s.m.bin(original, Bin::Mul, group, width);
+            let x = self.s.m.bin(original, Bin::Add, first, thread);
+            let zero = self.s.m.i32(0);
+            let unlimited = self.s.m.cmp(original, pred::EQ, limit, zero);
+            let inside = self.s.m.cmp(original, pred::IULT, x, limit);
+            let active = self.s.m.bin(original, Bin::Or, unlimited, inside);
+            let body = self.s.m.new_block();
+            let done = self.s.m.new_block();
+            self.s.m.terminate(original, Term::CondBr(active, body, done));
+            self.s.m.terminate(done, Term::Ret);
+            self.s.entry = body;
+        }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {

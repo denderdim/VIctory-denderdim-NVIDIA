@@ -223,6 +223,9 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// The threads in x of the dispatch of individual threads being bound
+    /// (`dispatch_x`), else 0 ([`victory_shader::emit::USER_DISPATCH_THREADS_X`]).
+    threads_x: u32,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -777,7 +780,10 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        if kind == USER_DISPATCH_THREADS_X {
+            return self.threads_x;
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -2035,6 +2041,31 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
+    /// `DispatchX` with the console's flags. Flag 0x20 gives individual
+    /// threads, not groups: the ray-tracing structure builder dispatches its
+    /// box decompression, header and geometry reload passes so (found by
+    /// DexNom). Taken as groups, those passes ran up to a group size times
+    /// too many threads, which stored past the builder's arrays into the
+    /// title's objects: the title crashed on pointers of float bounds within
+    /// seconds of the builder's first run (2026-11-25, runs rt2 and rt3).
+    /// The last group can still run threads past the count.
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        let this = self.pipeline as This;
+        if flags & 0x20 != 0 && crate::pipeline::is_builder(this) {
+            if let Some([gx, gy, gz]) = crate::pipeline::compute_group(this) {
+                let groups = [x.div_ceil(gx.max(1)), y.div_ceil(gy.max(1)), z.div_ceil(gz.max(1))];
+                once!(threads = ?[x, y, z], ?groups, "a builder dispatch of threads, not groups: run as groups");
+                // Programs translated with a thread limit end the last
+                // group's threads past `x`.
+                self.threads_x = x;
+                self.dispatch(list, groups[0], groups[1], groups[2]);
+                self.threads_x = 0;
+                return;
+            }
+        }
+        self.dispatch(list, x, y, z);
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
