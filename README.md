@@ -10,9 +10,24 @@ developer or publisher.
 
 ## State of this fork (2026-11-25)
 
-**Not playable yet.** Work on the NVIDIA side has just started; the first
-measurements on the target machine (RTX 5070 12 GB, Windows 11) are being
-taken and will be posted here.
+**Not playable yet.** First run on the target machine (RTX 5070 12 GB,
+driver 616.64, Core i5-14400F, 32 GB RAM, Windows 11), release build:
+
+| What | RTX 5070 |
+|------|----------|
+| Boot, menus | work, at the 240 fps cap |
+| Loading into the world | works; the first one translates shaders behind a black screen for minutes |
+| Frame rate in the world | **0.2 to 0.6 fps**: 1.5 to 2.4 s of GPU time per frame |
+| Picture in the world | badly broken: most geometry missing or scattered as dots |
+| RAM | about 16 GB in the process, 23 GB committed |
+
+Causes found so far, specific to NVIDIA:
+- **No 64-lane waves.** NVIDIA GPUs run 32-lane waves only; console compute
+  programs that exchange data across 64 lanes do not translate and their
+  dispatches are dropped (160 shaders did not translate in the first run).
+- **Descriptor heap limit.** NVIDIA's shader-visible view heap holds
+  1,000,000 descriptors; the game indexes slots past 1,010,000, so those
+  draws read the wrong resources or are dropped.
 
 The code it starts from ran the world at 3 to 5 fps on an AMD Radeon
 RX 9070 XT, with these known gaps:
