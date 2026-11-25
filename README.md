@@ -22,9 +22,14 @@ driver 616.64, Core i5-14400F, 32 GB RAM, Windows 11), release build:
 | RAM | about 16 GB in the process, 23 GB committed |
 
 Causes found so far, specific to NVIDIA:
-- **No 64-lane waves.** NVIDIA GPUs run 32-lane waves only; console compute
-  programs that exchange data across 64 lanes do not translate and their
-  dispatches are dropped (160 shaders did not translate in the first run).
+- **No 64-lane waves.** NVIDIA GPUs run 32-lane waves only. A console wave64
+  program runs as two host waves of 32 that must meet wherever the console
+  counts on 64 lanes in lockstep. Of the game's 2,682 compute programs, 293
+  did not translate for 32-lane waves; **now 44 do not** (all in groups of
+  more than 64 threads). Fixed so far: LDS shared within a wave, wave
+  reductions and prefix sums, `v_permlane16/x16`, and scalars kept across
+  divergent loops and branches (these gave wrong results in the lower half
+  even where the program translated).
 - **Descriptor heap limit.** NVIDIA's shader-visible view heap holds
   1,000,000 descriptors; the game indexes slots past 1,010,000, so those
   draws read the wrong resources or are dropped.
@@ -60,6 +65,9 @@ caches, saves, `crashes.log`) goes to the `cache_dir` and `data_dir` set in
 
 This fork:
 - Makes the game folder read-only (above).
+- Runs console wave64 compute programs on 32-lane GPUs (see the state
+  above); the GPU tests that check them across both halves pass on an
+  RTX 5070.
 
 Carried from the AMD fork it is based on (see Credits):
 
@@ -123,8 +131,9 @@ The first launch after a build translates every shader and builds about
 - No distant trees.
 - Some compute programs do not translate (ray-tracing structure builders,
   wind volumes, a few others) and their passes are dropped.
-- `crates/victory-shader/src/emit/lower.rs` is larger than the size limit of
-  `cargo xtask policy`; it is source code, not an asset.
+- `crates/victory-shader/src/emit/lower.rs` is larger than the general size
+  limit of `cargo xtask policy`; it has its own, larger limit there (it is
+  source code, not an asset) until it is split into modules.
 - Many changes are specific to this title and this GPU, and some are marked
   `shortcut:` in the code where they approximate what the console does.
 
