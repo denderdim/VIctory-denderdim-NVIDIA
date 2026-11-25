@@ -1,9 +1,10 @@
-# Runs the game with the fastest settings that leave the picture as it is,
-# measured on an RTX 5070 (i5-14400F): 4.7-5.4 fps in the prison prologue,
-# against 2.6-4.8 with the defaults (2026-11-25). Draw windows
-# (VICTORY_INDIRECT_WINDOW=1) gave 6.5-7.1 but cut hair strands, so they stay
-# off. The game folder is only read; caches and saves go to -Cache and
-# -Data, which must lie outside it.
+# Runs the game with the fastest settings proven to leave the picture as it
+# is, measured on an RTX 5070 (i5-14400F), prison prologue, 2026-11-25:
+# 6.7-7.2 fps, against 2.6-4.8 with the defaults.
+# Proof: VICTORY_INDIRECT_WINDOW_CHECK=1 compared 5.1 million windowed draws
+# with the per-draw clamp, 0 differed; VICTORY_BACK_OWN_CHECK=1 found no
+# store lost. The game folder is only read; caches and saves go to -Cache
+# and -Data, which must lie outside it.
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [string]$Cache = "D:\VIctory-PC\vfork-cache",
@@ -19,5 +20,9 @@ $env:VICTORY_ASYNC_SUBMIT = "1"     # a thread of the layer submits, not the tit
 $env:VICTORY_QUEUE2 = "1"           # fetches of shader writes on a copy queue
 $env:VICTORY_TEXTURE_NO_WAIT = "1"  # texture refreshes do not wait for remaps
 $env:VICTORY_COPY_PLAIN = "1"       # copies of title memory made in place
+$env:VICTORY_INDIRECT_WINDOW = "1"  # indirect draws clamped per window (off again at the first driver error)
+$env:VICTORY_INDIRECT_GATHER = "1"  # scattered indirect records clamped once per list
+$env:VICTORY_JOIN_PARTS = "1"       # consecutive submissions sent as one
+$env:VICTORY_BACK_OWN_VIEW = "1"    # shader writes stored back through our own view
 & $Exe run $Game --execute *> $Log
 Write-Host "Exited with $LASTEXITCODE; log: $Log"
