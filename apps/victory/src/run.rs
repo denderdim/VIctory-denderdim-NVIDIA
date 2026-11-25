@@ -4,6 +4,35 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+/// Refuses a writable folder of ours (`what`) inside the title's folder.
+fn ensure_outside_title(dir: &Path, title_dir: &Path, what: &str) -> Result<()> {
+    let key = |p: &Path| {
+        let p = if p.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            p
+        };
+        let mut s = std::path::absolute(p)
+            .unwrap_or_else(|_| p.to_owned())
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_lowercase();
+        while s.len() > 3 && s.ends_with('\\') {
+            s.pop();
+        }
+        s
+    };
+    let (dir_key, title_key) = (key(dir), key(title_dir));
+    if dir_key == title_key || dir_key.starts_with(&format!("{title_key}\\")) {
+        anyhow::bail!(
+            "{what} {} is inside the game folder {}; keep it outside so the game files stay untouched",
+            dir.display(),
+            title_dir.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -27,6 +56,10 @@ pub fn run(
         None => println!("build          unknown ({hash})"),
     }
 
+    // The game folder is the user's own copy: nothing of ours goes in it.
+    let title_dir = exe.parent().unwrap_or(Path::new("."));
+    ensure_outside_title(&cfg.cache_dir, title_dir, "cache_dir")?;
+    ensure_outside_title(&cfg.data_dir, title_dir, "data_dir")?;
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
@@ -49,7 +82,6 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
@@ -63,6 +95,8 @@ pub fn run(
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
+    // As on the console, the package cannot be written.
+    victory_hle::modules::files::protect(title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });

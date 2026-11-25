@@ -1,17 +1,48 @@
-# VIctory fork (work in progress)
+# VIctory for NVIDIA GeForce (work in progress) — by denderdim
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+Runs the Xbox Series build of GTA VI natively on a Windows PC with an NVIDIA
+card, from game files you supply yourself. **Goal: at least 30 fps on an
+RTX 5070.**
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's
-developer or publisher.
+**This repository contains no game files or assets.** You need your own copy
+of the game. Not affiliated with or endorsed by the game's developer or
+publisher.
+
+## State on the RTX 5070 (2026-11-25)
+
+Windows 11, Intel Core i5-14400F, NVIDIA GeForce RTX 5070 12 GB (driver
+616.64), 32 GB RAM.
+
+| | |
+|---|---|
+| Boot, menus | work, 30 fps |
+| Prologue (prison) | renders lit outdoors: yard, inmates, guard tower, trees, sky; HUD and prompts |
+| Indoors and in shadow | dark: the game's ray-traced light does not run yet (as on every fork) |
+| Frame rate in the world | 2.1 to 3.8 fps, GPU 99 % busy, about 330 of 7,000-10,000 draws a frame still skipped |
+| First world load | the screen stays grey for a few minutes while pipelines are built; cached after that |
+
+## Your game files stay untouched
+
+The game folder is mounted read-only for the title: writes, deletes,
+renames and attribute changes there are refused (CreateFile, fopen, _Fiopen,
+DeleteFile, MoveFile and the rest), and the cache and save folders are
+refused if they lie inside it. Deleting this project's folders leaves the
+game exactly as it was.
+
+## Base
+
+This fork is based on **hyphennn's
+[victory-fork](https://github.com/fxceless/victory-fork)** (developed on an
+Intel CPU and an NVIDIA RTX 4070), which was the base that rendered best on
+the RTX 5070 when three were compared on 2026-11-25 (also tried:
+Belobug's AMD fork, ztrx). Earlier work of this fork on the AMD base is kept
+on the branch `archive/belobug-amd-base`.
 
 ## Credits
 
+- **[victory-fork](https://github.com/fxceless/victory-fork)** by hyphennn
+  (fxceless): the base of this fork, its history kept intact below this
+  fork's commits. Its own credits follow.
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime
   services, the Direct3D 12 back end and the shader recompiler. Licensed
@@ -26,9 +57,13 @@ developer or publisher.
   VIctory #1122 by tightfall. The read-beside fix for kernel reads into title
   memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
   are carried here unchanged apart from one merge conflict.
+- [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)
+  was this fork's first base (see the archive branch), and
+  [Zettrox/ztrx](https://github.com/Zettrox/ztrx) was read and tried for
+  comparison.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-25)
+## Status of victory-fork, the base (its own notes, 2026-11-25)
 
 **Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
