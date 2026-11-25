@@ -1,9 +1,8 @@
-# VIctory fork for AMD Radeon (work in progress)
+# VIctory for NVIDIA GeForce (work in progress) — by denderdim
 
-This is a fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
-and its contributors. It follows upstream `main` up to `8e79c80` (2026-11-24),
-carries a number of upstream pull requests, and adds fixes found while running
-the game's world on one AMD card.
+A fork of [VIctory](https://github.com/Marvisak/VIctory) aimed at NVIDIA
+GeForce cards. **Goal: at least 30 fps in the game's world on an RTX 5070
+(12 GB).**
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
@@ -11,25 +10,43 @@ developer or publisher.
 
 ## State of this fork (2026-11-25)
 
-**Not playable yet: 3 to 5 frames per second.** Tested on one machine only:
-Windows 11, AMD Radeon RX 9070 XT 16 GB, Ryzen 7 9800X3D, 64 GB RAM, Series X
-profile. Nothing here has been run on an NVIDIA or Intel card.
+**Not playable yet.** Work on the NVIDIA side has just started; the first
+measurements on the target machine (RTX 5070 12 GB, Windows 11) are being
+taken and will be posted here.
 
-| What | State on that machine |
-|------|-----------------------|
-| Boot, menus | work, 30 fps (as upstream) |
+The code it starts from ran the world at 3 to 5 fps on an AMD Radeon
+RX 9070 XT, with these known gaps:
+
+| What | State it starts from |
+|------|----------------------|
+| Boot, menus | work, 30 fps |
 | The world | renders lit, with textures, people, vehicles, vegetation, water and sky |
 | Saves | load and store |
-| Frame rate in the world | 3 to 5 fps (4.4 to 4.9 standing still in a heavy scene, about 3 while driving) |
+| Frame rate in the world | 3 to 5 fps on an RX 9070 XT; RTX 5070 not yet measured |
 | Light in shadow | a constant: the game's ray-traced indirect light does not run, so shaded places are flat and rather dark |
 | Distant trees | not drawn (see below) |
-| Vehicles in motion | **broken**: parts of moving vehicles are left behind or stretched across the screen; under investigation |
-| Memory | about 22 GB of RAM and more video memory than a 16 GB card has |
+| Vehicles in motion | **broken**: parts of moving vehicles are left behind or stretched across the screen |
+| Memory | about 22 GB of RAM, and more video memory than a 12 GB card has: a main target of this fork |
 
-A driver timeout (Windows resets the display driver, every monitor goes black
-for a moment) happened once in the session this was written in. Expect it.
+Entering the world can make Windows reset the display driver (every monitor
+goes black for a moment). Expect it.
 
-### What this fork changes over upstream
+### Your game files stay untouched
+
+The game folder is **read-only** to the title, as the package drive is on
+the console: any attempt to write, create, delete, rename or change the
+attributes or times of a file in it fails with "access denied", whether the
+title names it as `G:\` or by its real path. VIctory also refuses a cache or
+data folder inside the game folder. Everything it writes (shader and pipeline
+caches, saves, `crashes.log`) goes to the `cache_dir` and `data_dir` set in
+`victory.toml`, so deleting those folders leaves the game exactly as it was.
+
+### What this fork changes over upstream VIctory
+
+This fork:
+- Makes the game folder read-only (above).
+
+Carried from the AMD fork it is based on (see Credits):
 
 Picture:
 - The world's indirect diffuse light is replaced by a constant while the ray
@@ -102,13 +119,17 @@ The first launch after a build translates every shader and builds about
   contributors is the base of everything here. Licensed GPL-3.0-or-later; so
   is this fork. Upstream's history and the authors of the pull requests
   carried here are kept in the commit history.
+- **[VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**
+  by Belobug: the AMD Radeon fork this one starts from (at `4cbe9d7`,
+  2026-11-25). Its fixes listed above are its work, kept with their authors
+  in the commit history.
 - [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and
   [myokex/victory-amd](https://github.com/myokex/victory-amd) were read for
-  comparison; no code of theirs is in this fork.
+  comparison by the AMD fork; no code of theirs is here.
 - [XCL](https://github.com/ivall/xcl) by ivall: its README was read; no code
   of it is here.
-- This fork's changes were developed with
-  [Claude Code](https://claude.com/claude-code) and Gemini (Antigravity).
+- Changes were developed with [Claude Code](https://claude.com/claude-code)
+  (and, in the AMD fork, Gemini (Antigravity)).
 
 Everything below this line is upstream VIctory's own README, unchanged; its
 status section describes upstream, not this fork.
