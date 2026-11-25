@@ -150,6 +150,10 @@ The first launch after a build translates every shader and builds about
 - [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and
   [myokex/victory-amd](https://github.com/myokex/victory-amd) were read for
   comparison by the AMD fork; no code of theirs is here.
+- **[Zettrox/ztrx](https://github.com/Zettrox/ztrx)** (GPL-3.0-or-later), an
+  NVIDIA fork: this fork's console thread numbering on 32-lane hosts and the
+  whole-loop `clzero` emulation follow its approach (ztrx credits XCL for
+  the latter).
 - [XCL](https://github.com/ivall/xcl) by ivall: its README was read; no code
   of it is here.
 - Changes were developed with [Claude Code](https://claude.com/claude-code)
