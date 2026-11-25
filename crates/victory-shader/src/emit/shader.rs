@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -199,7 +199,14 @@ impl Shader {
             && let Some(&(_, limit)) = self.limits.iter().find(|l| l.0 == args[0])
         {
             let i32t = self.t.i32;
-            let at = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[args[1], limit]);
+            let at = self.op(
+                block,
+                "binary.i32",
+                Attr::ReadNone,
+                i32t,
+                40,
+                &[args[1], limit],
+            );
             let mut args = args.to_vec();
             args[1] = at;
             return self.op_as_is(block, name, attr, ret, opcode, &args);
@@ -407,11 +414,52 @@ impl Shader {
         let index = if !sampler && super::limits_indices() {
             let last = self.m.i32(super::OWN_SLOTS - 1);
             let i32t = self.t.i32;
-            self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last])
+            self.op(
+                block,
+                "binary.i32",
+                Attr::ReadNone,
+                i32t,
+                40,
+                &[index, last],
+            )
+        } else {
+            index
+        };
+        let index = if !sampler && super::pages_views() {
+            self.page_mapped(block, index)
         } else {
             index
         };
         self.handle_at(block, index, sampler, nonuniform, props)
+    }
+
+    /// The heap index of virtual view slot `index` (below
+    /// [`super::OWN_SLOTS`]): its page's first slot, from the host's page
+    /// map in the stride table (dword [`super::PAGES_AT`] on), plus its
+    /// place in the page. Indices of the host's own slots (views of memory
+    /// by address) are not virtual and do not come here (`handle_at`).
+    pub fn page_mapped(&mut self, block: usize, index: V) -> V {
+        let table = self.stride_table_handle();
+        let shift = self.m.i32(super::PAGE.trailing_zeros());
+        let page = self.m.bin(block, Bin::LShr, index, shift);
+        let at = self.m.i32(super::PAGES_AT);
+        let entry = self.m.bin(block, Bin::Add, page, at);
+        let four = self.m.i32(4);
+        let addr = self.m.bin(block, Bin::Mul, entry, four);
+        let (iu, mask, align) = (self.m.undef(self.t.i32), self.m.i8(1), self.m.i32(4));
+        let r = self.op(
+            block,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.t.res_ret,
+            139,
+            &[table, addr, iu, mask, align],
+        );
+        let first = self.m.extract(block, r, 0);
+        let first = self.m.cast(block, Cast::Bitcast, first, self.t.i32);
+        let low = self.m.i32(super::PAGE - 1);
+        let within = self.m.bin(block, Bin::And, index, low);
+        self.m.bin(block, Bin::Add, first, within)
     }
 
     /// A handle of the heap slot at `index`, which is known to be in it.
@@ -877,5 +925,38 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Shader;
+
+    /// View heap handles read the page map (marking the stride table read,
+    /// so the host binds it); sampler handles and test builds without
+    /// paging do not.
+    #[test]
+    fn heap_handles_read_the_page_map() {
+        let handle = |paged: bool, sampler: bool| {
+            super::super::PAGED.with(|p| p.set(paged));
+            let mut s = Shader::new(false);
+            let (block, index) = (s.entry, s.m.i32(1_010_652));
+            s.heap_handle(block, index, sampler, false, (11, 0));
+            super::super::PAGED.with(|p| p.set(false));
+            (
+                s.stride_table.is_some(),
+                s.m.declares("dx.op.rawBufferLoad.f32"),
+            )
+        };
+        assert_eq!(handle(true, false), (true, true));
+        assert_eq!(handle(true, true), (false, false));
+        assert_eq!(handle(false, false), (false, false));
+        // Handles of slots known to be the host's own are not paged.
+        super::super::PAGED.with(|p| p.set(true));
+        let mut s = Shader::new(false);
+        let (block, index) = (s.entry, s.m.i32(0));
+        s.handle_at(block, index, false, false, (11, 0));
+        super::super::PAGED.with(|p| p.set(false));
+        assert!(s.stride_table.is_none());
     }
 }

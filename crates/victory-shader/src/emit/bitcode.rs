@@ -362,6 +362,12 @@ impl Module {
         }
     }
 
+    /// Test builds: whether function `name` is declared.
+    #[cfg(test)]
+    pub fn declares(&self, name: &str) -> bool {
+        self.func_ids.contains_key(name)
+    }
+
     /// A function declaration (or `main` with `body`), found by name.
     pub fn function(&mut self, name: &str, ty: Ty, attr: Option<Attr>, body: bool) -> V {
         if let Some(&i) = self.func_ids.get(name) {

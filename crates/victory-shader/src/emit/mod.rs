@@ -82,22 +82,22 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
-#[cfg(test)]
-mod memory_tests;
-#[cfg(all(test, windows))]
-mod image_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
-mod lds_tests;
+mod image_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
+#[cfg(all(test, windows))]
+mod lds_tests;
 mod lower;
-mod rectangle;
+#[cfg(test)]
+mod memory_tests;
 #[cfg(test)]
 mod opcode_audit;
 #[cfg(all(test, windows))]
 mod opcode_tests;
+mod rectangle;
 mod sampler;
 #[cfg(all(test, windows))]
 mod scratch_tests;
@@ -165,15 +165,50 @@ pub fn rays() -> bool {
     *RAYS.get_or_init(|| cfg!(test) || std::env::var("VICTORY_RAYS").is_ok_and(|v| v == "1"))
 }
 
-/// Slots the host's view heaps have at least (`victory-gpu` pads them); the
-/// last is always null. The title's heap is 1,245,184 slots, with
-/// `victory-gpu`'s own slots after it.
+/// Slots of the host's view heaps as shaders index them (virtual slots,
+/// through the page map at [`PAGES_AT`]); the last is always null. The
+/// title's heap is 1,245,184 slots, with `victory-gpu`'s own slots after it.
 pub const VIEW_SLOTS: u32 = 2_294_784;
 
 /// Those before the views of memory by address, which programs without
 /// such views stay below.
 pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
 
+/// Slots per page of the view heaps' page map: the indices shaders compute
+/// from title data (below [`OWN_SLOTS`]) are virtual, and the host maps
+/// each page of them to a page of its heap (on hosts whose view heaps are
+/// smaller than [`VIEW_SLOTS`], 1,000,000 slots on NVIDIA).
+pub const PAGE: u32 = 256;
+
+/// The pages of virtual slots the page map has an entry for.
+pub const VIEW_PAGES: u32 = OWN_SLOTS / PAGE;
+
+/// The dword of the stride table (`t0`, [`STRIDE_SPACE`]) the page map
+/// starts at: after the strides (from 0) and the element counts (from
+/// [`OWN_SLOTS`]) of the [`OWN_SLOTS`] virtual slots. Entry `p` holds the
+/// heap index of virtual page `p`'s first slot.
+pub const PAGES_AT: u32 = 2 * OWN_SLOTS;
+
+const _: () = assert!(OWN_SLOTS % PAGE == 0);
+
+#[cfg(test)]
+thread_local! {
+    /// Test builds: whether heap indices go through the page map (as they
+    /// always do outside tests; tests' own hosts bind no page map).
+    pub(crate) static PAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether view heap indices go through the host's page map.
+fn pages_views() -> bool {
+    #[cfg(test)]
+    {
+        PAGED.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
 
 /// Whether heap indices are kept below [`VIEW_SLOTS`]: skinning programs
 /// take them from title data, and one past the heap stops the host GPU.
@@ -372,9 +407,7 @@ fn emit_program(
     // (`SV_DepthGreaterEqual`/`SV_DepthLessEqual`) require centroid or sample
     // interpolation on `SV_Position`.
     let conservative_depth = pixel && outputs.iter().any(|o| matches!(o.kind, 18 | 19));
-    let psv_modes = c
-        .part(FourCC::PSV0)
-        .and_then(|p| psv_interp(p.data, pixel));
+    let psv_modes = c.part(FourCC::PSV0).and_then(|p| psv_interp(p.data, pixel));
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
     for e in interpolated.iter_mut() {
         e.interp = match (e.kind, e.comp) {
@@ -394,9 +427,9 @@ fn emit_program(
             _ => 0,
         };
         if let Some(modes) = &psv_modes
-            && let Some(&(_, _, _, m)) = modes
-                .iter()
-                .find(|&&(row, col, kind, m)| row == e.row && col == e.col && kind == e.kind && m != 0)
+            && let Some(&(_, _, _, m)) = modes.iter().find(|&&(row, col, kind, m)| {
+                row == e.row && col == e.col && kind == e.kind && m != 0
+            })
         {
             e.interp = if e.kind == 3 && conservative_depth && m == 4 {
                 5
@@ -1569,6 +1602,20 @@ mod tests {
 
     #[test]
     fn structured_buffer_unknown_stride_uses_runtime_stride_table() {
+        unknown_stride_through_stride_table(false);
+    }
+
+    /// The same through the page map: virtual slots 0 and 1 are at heap
+    /// slots 2 and 3 (page 0 mapped there), heap slots 0 and 1 hold other
+    /// views.
+    #[test]
+    fn heap_indices_go_through_the_page_map() {
+        super::PAGED.with(|p| p.set(true));
+        unknown_stride_through_stride_table(true);
+        super::PAGED.with(|p| p.set(false));
+    }
+
+    fn unknown_stride_through_stride_table(paged: bool) {
         let words: &[u32] = &[
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0202,
@@ -1685,6 +1732,28 @@ mod tests {
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let srv_data: Vec<u32> = (100..112).collect();
+            let other: Vec<u32> = vec![7; 12];
+            let mut table = vec![12, 12];
+            let mut views = vec![
+                super::host::View::Buffer {
+                    data: &srv_data,
+                    stride: super::host::Stride::Raw,
+                },
+                super::host::View::RawUav(64),
+            ];
+            if paged {
+                table.resize((super::PAGES_AT + 1) as usize, 0);
+                table[super::PAGES_AT as usize] = 2;
+                for _ in 0..2 {
+                    views.insert(
+                        0,
+                        super::host::View::Buffer {
+                            data: &other,
+                            stride: super::host::Stride::Raw,
+                        },
+                    );
+                }
+            }
             let out = host
                 .dispatch(
                     &root,
@@ -1696,17 +1765,11 @@ mod tests {
                                 1,
                                 super::host::Root::View {
                                     srv: true,
-                                    data: vec![12, 12],
+                                    data: table,
                                 },
                             ),
                         ],
-                        views: &[
-                            super::host::View::Buffer {
-                                data: &srv_data,
-                                stride: super::host::Stride::Raw,
-                            },
-                            super::host::View::RawUav(64),
-                        ],
+                        views: &views,
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
