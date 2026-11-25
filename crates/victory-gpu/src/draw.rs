@@ -58,7 +58,10 @@ struct Fixed {
     scissors: Vec<RECT>,
     blend: Option<Option<[f32; 4]>>,
     stencil: Option<u32>,
-    views: Option<(Vec<crate::descriptor::RtvRecord>, Option<crate::descriptor::RtvRecord>)>,
+    views: Option<(
+        Vec<crate::descriptor::RtvRecord>,
+        Option<crate::descriptor::RtvRecord>,
+    )>,
 }
 
 // SAFETY: the views only name title resources.
@@ -175,7 +178,10 @@ fn null_uav_dropped(pipeline: &str) {
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if seen.len() < 256 && !seen.iter().any(|s| s == pipeline) {
         seen.push(pipeline.to_owned());
-        tracing::warn!(pipeline, "a dispatch writing through a null unordered access view dropped");
+        tracing::warn!(
+            pipeline,
+            "a dispatch writing through a null unordered access view dropped"
+        );
     }
 }
 
@@ -233,7 +239,11 @@ fn longest(heap: &crate::descriptor::Heap, table: u64, n: u32) -> u32 {
     let mut all = LONGEST.lock().unwrap_or_else(|e| e.into_inner());
     let most = all.get_or_insert_default().entry(table).or_insert(n);
     *most = (*most).max(n);
-    if heap.index(table + u64::from(*most - 1) * 32).is_some() { *most } else { n }
+    if heap.index(table + u64::from(*most - 1) * 32).is_some() {
+        *most
+    } else {
+        n
+    }
 }
 
 /// The last byte of the root view at `address` four dwords can be read from:
@@ -351,7 +361,12 @@ impl State {
     }
 
     pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
-        for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
+        for slot in self
+            .vertex
+            .iter_mut()
+            .skip(start as usize)
+            .take(count as usize)
+        {
             *slot = VertexView::default();
         }
     }
@@ -363,9 +378,9 @@ impl State {
     /// Whether the clamps of indirect draws recorded in `list` now go to
     /// the list before it.
     pub(crate) fn hoists_into(&self, list: &HostList) -> bool {
-        self.hoist
-            .as_ref()
-            .is_some_and(|h| h.into == std::ptr::from_ref(list) as usize && h.writes == list.writes())
+        self.hoist.as_ref().is_some_and(|h| {
+            h.into == std::ptr::from_ref(list) as usize && h.writes == list.writes()
+        })
     }
 
     /// From here on the clamps of `into`'s indirect draws go to `clamps`.
@@ -505,7 +520,9 @@ impl State {
                     0
                 }
             },
-            (Some(Root::View(address)), RootType::Descriptor) => (address >> (32 * dword.min(1))) as u32,
+            (Some(Root::View(address)), RootType::Descriptor) => {
+                (address >> (32 * dword.min(1))) as u32
+            }
             (Some(Root::Constants(c)), RootType::Constants) => {
                 c.get(dword as usize).copied().unwrap_or(0)
             }
@@ -547,7 +564,11 @@ impl State {
             }
         }
         if self.heaps[0] != 0 {
-            return Some(crate::descriptor::heap(self.heaps[0] as This).host()?.memory());
+            return Some(
+                crate::descriptor::heap(self.heaps[0] as This)
+                    .host()?
+                    .memory(),
+            );
         }
         static OURS: std::sync::OnceLock<Option<crate::descriptor::host::HostHeap>> =
             std::sync::OnceLock::new();
@@ -816,7 +837,11 @@ impl State {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
-                        once!(slot, kind, "a shader reads a root view the title did not set");
+                        once!(
+                            slot,
+                            kind,
+                            "a shader reads a root view the title did not set"
+                        );
                         return no("a root view not set");
                     };
                     let Some(gpu) = root_view(list, *address, kind) else {
@@ -900,13 +925,24 @@ impl State {
             _ => (x, None),
         };
         if threads && limit.is_none() {
-            once!(name = p.name, x, y, z, "a dispatch of threads runs as groups: dropped");
+            once!(
+                name = p.name,
+                x,
+                y,
+                z,
+                "a dispatch of threads runs as groups: dropped"
+            );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         // Programs that take their groups' start from us run in parts.
         let start = p.stages.first().and_then(|s| {
-            let groups = s.translated().host.user_data.iter().find(|u| u.root == RootType::GROUPS);
+            let groups = s
+                .translated()
+                .host
+                .user_data
+                .iter()
+                .find(|u| u.root == RootType::GROUPS);
             Some((s.user_data?.0, groups?.index))
         });
         if !dispatch_fits(if start.is_some() { 1 } else { x }, y, z) {
@@ -929,7 +965,9 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true, false));
         #[cfg(feature = "diagnostics")]
-        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("dispatch {x}x{y}x{z}"), true, true));
+        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || {
+            self.op_text(format!("dispatch {x}x{y}x{z}"), true, true)
+        });
         if let (Some((param, index, _)), Some(most)) = (limit, most) {
             // SAFETY: an open list; a dword of the program's user data.
             unsafe { list.list.SetComputeRoot32BitConstant(param, most, index) };
@@ -965,13 +1003,19 @@ impl State {
         use std::fmt::Write;
         static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let most = *MOST.get_or_init(|| {
-            std::env::var("VICTORY_DROPPED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            std::env::var("VICTORY_DROPPED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
         });
         static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, u32>>> =
             std::sync::Mutex::new(None);
         {
             let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-            let n = seen.get_or_insert_default().entry(self.pipeline).or_default();
+            let n = seen
+                .get_or_insert_default()
+                .entry(self.pipeline)
+                .or_default();
             if *n >= most {
                 return;
             }
@@ -981,8 +1025,15 @@ impl State {
         for (i, root) in self.roots_ref(true).iter().enumerate() {
             match root {
                 Root::View(a) => {
-                    let host = crate::shadow::find_reaching(*a, 1)
-                        .map(|s| if s.is_direct() { "in place" } else if s.is_sparse() { "sparse" } else { "copy" });
+                    let host = crate::shadow::find_reaching(*a, 1).map(|s| {
+                        if s.is_direct() {
+                            "in place"
+                        } else if s.is_sparse() {
+                            "sparse"
+                        } else {
+                            "copy"
+                        }
+                    });
                     let _ = write!(text, " {i}:view {a:#x} {host:?}");
                 }
                 Root::Constants(w) => {
@@ -991,7 +1042,10 @@ impl State {
                 _ => {}
             }
         }
-        tracing::info!("dropped {} {x}x{y}x{z}{text}", crate::pipeline::names(self.pipeline as This));
+        tracing::info!(
+            "dropped {} {x}x{y}x{z}{text}",
+            crate::pipeline::names(self.pipeline as This)
+        );
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1032,17 +1086,16 @@ impl State {
                 .chain(&stage.root_uavs)
             {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
-                    let host = crate::shadow::find(*address, 1)
-                        .map(|s| {
-                            let kind = if s.is_direct() {
-                                "in place"
-                            } else if s.is_sparse() {
-                                "sparse"
-                            } else {
-                                "copy"
-                            };
-                            format!("{kind} {:#x} left {:#x}", s.gpu(*address), s.left(*address))
-                        });
+                    let host = crate::shadow::find(*address, 1).map(|s| {
+                        let kind = if s.is_direct() {
+                            "in place"
+                        } else if s.is_sparse() {
+                            "sparse"
+                        } else {
+                            "copy"
+                        };
+                        format!("{kind} {:#x} left {:#x}", s.gpu(*address), s.left(*address))
+                    });
                     let _ = write!(text, " root{slot}={address:#x} host {host:?}");
                     let _ = write!(text, " holds {}", title_words(*address, 24));
                 }
@@ -1061,7 +1114,11 @@ impl State {
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
         if !compute {
-            let _ = write!(text, " targets {:#x?} depth {:#x}", self.targets, self.depth);
+            let _ = write!(
+                text,
+                " targets {:#x?} depth {:#x}",
+                self.targets, self.depth
+            );
         }
         text
     }
@@ -1081,8 +1138,10 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false, false));
-        #[cfg(feature = "diagnostics")]
-        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("mesh {x}"), false, true));
+                    #[cfg(feature = "diagnostics")]
+                    crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || {
+                        self.op_text(format!("mesh {x}"), false, true)
+                    });
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     list.count_work();
@@ -1145,10 +1204,10 @@ impl State {
             .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
             .map(|u| u.slot)
             .collect();
-        // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
-        // are made afresh too: the title's slots there have no host slot of
-        // their own.
+        // Tables reaching slots the host heap has none for are made afresh
+        // too: past a sampler heap capped at the host's limit (2,048
+        // anywhere), or on a virtual page of a paged view heap (NVIDIA,
+        // 1,000,000 views at most) that found no page left to map.
         for u in used.iter().filter(tables) {
             if fresh.contains(&u.slot) {
                 continue;
@@ -1163,7 +1222,7 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            if !host.backed(index) {
                 fresh.push(u.slot);
             }
         }
@@ -1198,7 +1257,11 @@ impl State {
             let last = table + u64::from(n - 1) * 32;
             // Shaders read such a table to many lengths, and a copy for each
             // ran out of slots: the longest seen serves all.
-            let n = if n >= LARGE { longest(heap, table, n) } else { n };
+            let n = if n >= LARGE {
+                longest(heap, table, n)
+            } else {
+                n
+            };
             if heap.index(last).is_none() {
                 for u in entries {
                     self.table_entry(list, u, compute);
@@ -1222,7 +1285,9 @@ impl State {
                 .unwrap_or(1);
             let same = self.large_tables.get(&table).and_then(|made| {
                 made.iter()
-                    .find(|(r, _)| r.len() >= needed && r[..needed] == records[..needed.min(records.len())])
+                    .find(|(r, _)| {
+                        r.len() >= needed && r[..needed] == records[..needed.min(records.len())]
+                    })
                     .map(|&(_, first)| first)
             });
             if n >= LARGE
@@ -1265,7 +1330,10 @@ impl State {
                 // would view them misaligned: the draw is dropped. Other
                 // tables fall back to the title's slots.
                 if entries.iter().any(|u| u.kind == ResourceType::Cbv) {
-                    once!(n, "a constant table did not fit in command-list slots; draw dropped");
+                    once!(
+                        n,
+                        "a constant table did not fit in command-list slots; draw dropped"
+                    );
                     return None;
                 }
                 once!(n, "descriptor table did not fit in command-list slots");
@@ -1276,7 +1344,10 @@ impl State {
             };
             self.fresh_tables.insert(key, first);
             if n >= LARGE {
-                self.large_tables.entry(table).or_default().push((records, first));
+                self.large_tables
+                    .entry(table)
+                    .or_default()
+                    .push((records, first));
             }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
@@ -1403,8 +1474,10 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false, false));
-        #[cfg(feature = "diagnostics")]
-        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("draw {count}x{instances}"), false, true));
+            #[cfg(feature = "diagnostics")]
+            crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || {
+                self.op_text(format!("draw {count}x{instances}"), false, true)
+            });
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1500,8 +1573,10 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false, false));
-        #[cfg(feature = "diagnostics")]
-        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("indexed {indices}x{instances}"), false, true));
+            #[cfg(feature = "diagnostics")]
+            crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || {
+                self.op_text(format!("indexed {indices}x{instances}"), false, true)
+            });
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1559,8 +1634,14 @@ impl State {
             }
             let shadow = crate::shadow::find(v.address, u64::from(v.size))?;
             shadow.refresh(list, v.address, u64::from(v.size));
-            let (_, gpu, size) =
-                crate::rects::vertices(list, host, shadow.gpu(v.address), u64::from(v.size), v.stride, &elements)?;
+            let (_, gpu, size) = crate::rects::vertices(
+                list,
+                host,
+                shadow.gpu(v.address),
+                u64::from(v.size),
+                v.stride,
+                &elements,
+            )?;
             views.push((
                 slot,
                 D3D12_VERTEX_BUFFER_VIEW {
@@ -1701,7 +1782,8 @@ impl State {
         // on the GPU, before the draw's own pipeline is bound.
         let mut rect_args: Option<ID3D12Resource> = None;
         let mut rect_vertices: Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)> = Vec::new();
-        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES && !self.draws_rectangles() {
+        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES && !self.draws_rectangles()
+        {
             match self.indirect_rectangles(list, kind, &bounded, stride, max) {
                 Some((a, views)) => {
                     rect_args = Some(a);
@@ -1939,7 +2021,11 @@ fn describe(view: Option<&View>) -> String {
             let d = unsafe { t.GetDesc() };
             format!(
                 "{}x{} f{} flags {:#x} data {:#x}",
-                d.Width, d.Height, d.Format.0, d.Flags.0, crate::resource::data_of(r)
+                d.Width,
+                d.Height,
+                d.Format.0,
+                d.Flags.0,
+                crate::resource::data_of(r)
             )
         })
     };
@@ -2002,7 +2088,10 @@ pub(crate) fn report_slots(indices: &[u32]) -> String {
     let Some(h) = crate::descriptor::heap(heap as This).host() else {
         return String::new();
     };
-    indices.iter().map(|&i| format!(" SLOT {i:#x} {}", h.report_slot(i))).collect()
+    indices
+        .iter()
+        .map(|&i| format!(" SLOT {i:#x} {}", h.report_slot(i)))
+        .collect()
 }
 
 /// The console's own primitive topologies.
